@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">自动跳过</string>
+    <string name="accessibility_service_label">自动跳过服务</string>
+    <string name="accessibility_service_description">此服务基于记录的规则自动点击界面元素（例如跳过广告）。它可以帮助减少重复操作。</string>
+    <string name="tile_label">录制规则</string>
+    <string name="dump_tile_label">提取页面节点快照</string>
+</resources>
