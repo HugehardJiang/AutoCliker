@@ -16,6 +16,10 @@ class ClickRuleRepository(private val context: Context, private val dao: ClickRu
     private val _isRecording = MutableStateFlow(prefs.getBoolean("is_recording", false))
     val isRecording: StateFlow<Boolean> = _isRecording
 
+    // Master Switch: Global enable for the auto-clicking logic
+    private val _isGlobalEnabled = MutableStateFlow(prefs.getBoolean("is_global_enabled", true))
+    val isGlobalEnabled: StateFlow<Boolean> = _isGlobalEnabled
+
     // Whitelist state for apps enabled for auto-clicking
     private val _enabledPackages = MutableStateFlow(prefs.getStringSet("enabled_packages", emptySet()) ?: emptySet())
     val enabledPackages: StateFlow<Set<String>> = _enabledPackages
@@ -37,6 +41,11 @@ class ClickRuleRepository(private val context: Context, private val dao: ClickRu
         _isRecording.value = newState
     }
     
+    fun toggleGlobalEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("is_global_enabled", enabled).apply()
+        _isGlobalEnabled.value = enabled
+    }
+
     fun stopRecording() {
         prefs.edit().putBoolean("is_recording", false).apply()
         _isRecording.value = false
@@ -45,6 +54,7 @@ class ClickRuleRepository(private val context: Context, private val dao: ClickRu
     // Call this to sync up state when the accessibility service / app resumes
     fun syncRecordingState() {
         _isRecording.value = prefs.getBoolean("is_recording", false)
+        _isGlobalEnabled.value = prefs.getBoolean("is_global_enabled", true)
     }
 
     suspend fun getActiveRulesForPackage(packageName: String): List<ClickRule> {

@@ -57,17 +57,23 @@ object GkdParser {
             
             val rulesArray = groupObj.optJSONArray("rules") ?: JSONArray()
             
+            // Generate a deterministic groupKey for sequence isolation
+            val groupKey = "${subName}:${defaultPackageName}:${groupName}".hashCode()
+
             // Sometimes rules is a single string or object
             if (rulesArray.length() == 0 && groupObj.has("rules")) {
                 val rulesObj = groupObj.opt("rules")
                 if (rulesObj is String) {
-                    addRule(ruleList, defaultPackageName, defaultAppName, rulesObj, null, groupName, groupDesc, subName, subUrl, isGlobal)
+                    addRule(ruleList, defaultPackageName, defaultAppName, rulesObj, null, groupName, groupDesc, subName, subUrl, isGlobal, null, null, groupKey, null)
                     continue
                 } else if (rulesObj is JSONObject) {
                     val matchesList = parseStringOrArray(rulesObj.opt("matches"))
                     val excludeMatches = rulesObj.optString("excludeMatches")
+                    val key = if (rulesObj.has("key")) rulesObj.optInt("key") else null
+                    val preKeysList = parseStringOrArray(rulesObj.opt("preKeys"))
+                    val preKeysStr = if (preKeysList.isNotEmpty()) preKeysList.joinToString(",") else null
                     for (match in matchesList) {
-                        addRule(ruleList, defaultPackageName, defaultAppName, match, excludeMatches, groupName, groupDesc, subName, subUrl, isGlobal)
+                        addRule(ruleList, defaultPackageName, defaultAppName, match, excludeMatches, groupName, groupDesc, subName, subUrl, isGlobal, null, key, groupKey, preKeysStr)
                     }
                     continue
                 }
@@ -80,12 +86,15 @@ object GkdParser {
                     val excludeMatches = ruleObj.optString("excludeMatches")
                     val activityIdsList = parseStringOrArray(ruleObj.opt("activityIds"))
                     val activityIdsStr = if (activityIdsList.isNotEmpty()) activityIdsList.joinToString(",") else null
+                    val key = if (ruleObj.has("key")) ruleObj.optInt("key") else null
+                    val preKeysList = parseStringOrArray(ruleObj.opt("preKeys"))
+                    val preKeysStr = if (preKeysList.isNotEmpty()) preKeysList.joinToString(",") else null
                     
                     for (match in matchesList) {
-                        addRule(ruleList, defaultPackageName, defaultAppName, match, excludeMatches, groupName, groupDesc, subName, subUrl, isGlobal, activityIdsStr)
+                        addRule(ruleList, defaultPackageName, defaultAppName, match, excludeMatches, groupName, groupDesc, subName, subUrl, isGlobal, activityIdsStr, key, groupKey, preKeysStr)
                     }
                 } else if (ruleObj is String) {
-                    addRule(ruleList, defaultPackageName, defaultAppName, ruleObj, null, groupName, groupDesc, subName, subUrl, isGlobal)
+                    addRule(ruleList, defaultPackageName, defaultAppName, ruleObj, null, groupName, groupDesc, subName, subUrl, isGlobal, null, null, groupKey, null)
                 }
             }
         }
@@ -115,7 +124,10 @@ object GkdParser {
         subName: String,
         subUrl: String?,
         isGlobal: Boolean,
-        activityIds: String? = null
+        activityIds: String? = null,
+        ruleKey: Int? = null,
+        groupKey: Int? = null,
+        preKeys: String? = null
     ) {
         var finalSelector = matches
         if (matches.isEmpty()) return
@@ -132,7 +144,10 @@ object GkdParser {
                 isSubscription = true,
                 subscriptionName = subName,
                 subscriptionUrl = subUrl,
-                excludeCondition = excludeMatches?.takeIf { it.isNotBlank() }
+                excludeCondition = excludeMatches?.takeIf { it.isNotBlank() },
+                ruleKey = ruleKey,
+                groupKey = groupKey,
+                preKeys = preKeys
             )
         )
     }

@@ -1,6 +1,7 @@
 package cn.idiots.autoclick.service
 
 import android.accessibilityservice.AccessibilityService
+import android.content.Context
 import android.content.Intent
 import android.graphics.Rect
 import android.util.Log
@@ -15,11 +16,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import cn.idiots.autoclick.util.GkdSelector
-import android.accessibilityservice.GestureDescription
 import android.graphics.Path
+import android.view.Display
+import android.accessibilityservice.GestureDescription
+import android.accessibilityservice.AccessibilityService.TakeScreenshotCallback
+import android.accessibilityservice.AccessibilityService.ScreenshotResult
 import android.content.ComponentName
 import android.service.quicksettings.TileService
 import android.util.LruCache
+import android.graphics.Bitmap
+import java.io.FileOutputStream
+import java.io.File
 
 class AutoClickAccessibilityService : AccessibilityService() {
 
@@ -42,9 +49,21 @@ class AutoClickAccessibilityService : AccessibilityService() {
     
     // System Launchers Cache
     private var launcherPackages: Set<String> = emptySet()
+    
+    // Global switch state
+    private var isGlobalEnabled: Boolean = true
 
     // Cache pre-compiled ASTs for GKD selectors to avoid regex/string parsing on every accessibility event
     private val selectorCache = LruCache<String, GkdSelector>(500)
+
+    // Stage Tracking for Multi-stage Clicks
+    // Key: groupKey (from rule), Value: Set of satisfied ruleKeys
+    private val satisfiedKeys = java.util.concurrent.ConcurrentHashMap<Int, MutableSet<Int>>()
+    private var lastSequenceApp: String? = null
+    private var lastSequenceActivity: String? = null
+
+    // Per-Element Cooling: Map of "RuleId_NodeFingerprint" to last trigger timestamp
+    private val nodeTriggerHistory = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     companion object {
         var instance: AutoClickAccessibilityService? = null
@@ -72,6 +91,12 @@ class AutoClickAccessibilityService : AccessibilityService() {
                 enabledPackages = packages
             }
         }
+
+        serviceScope.launch {
+            repository.isGlobalEnabled.collect { enabled ->
+                isGlobalEnabled = enabled
+            }
+        }
         
         Log.d("AutoClicker", "Service Connected")
 
@@ -92,6 +117,10 @@ class AutoClickAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
+        
+        // GLOBAL MASTER SWITCH: If function is disabled via Dashboard, stop all processing immediately
+        if (!isGlobalEnabled) return
+
         val packageName = event.packageName?.toString() ?: return
 
         // APP WHITELIST FILTERING: 
@@ -178,6 +207,14 @@ class AutoClickAccessibilityService : AccessibilityService() {
         if (rules.isEmpty()) return
 
         var foundMatch = false
+        
+        // Reset sequence state if app or activity changed
+        if (lastSequenceApp != packageName || lastSequenceActivity != currentActivityId) {
+            satisfiedKeys.clear()
+            lastSequenceApp = packageName
+            lastSequenceActivity = currentActivityId
+        }
+
         for (rule in rules) {
             // Filter by Activity ID if rule specifies it
             if (!rule.activityIds.isNullOrEmpty()) {
@@ -191,14 +228,40 @@ class AutoClickAccessibilityService : AccessibilityService() {
                 continue
             }
 
-            if (findAndClick(rootNode, rule)) {
-                recordRuleTrigger(rule.id)
-                Log.d("AutoClicker", "SUCCESS: Triggered rule [${rule.groupName ?: "Default"}] for $packageName")
-                serviceScope.launch {
-                    repository.logClick(rule)
+            // Multi-stage Check: Check if preKeys (if any) are satisfied
+            if (!rule.preKeys.isNullOrEmpty() && rule.groupKey != null) {
+                val groupSatisfied = satisfiedKeys[rule.groupKey] ?: emptySet<Int>()
+                val requiredKeys = rule.preKeys.split(",").mapNotNull { it.trim().toIntOrNull() }
+                if (!requiredKeys.all { groupSatisfied.contains(it) }) {
+                    continue // Sequence requirement not met
                 }
-                foundMatch = true
-                break 
+            }
+
+            val targetNode = findMatch(rootNode, rule)
+            if (targetNode != null) {
+                val fingerprint = getNodeFingerprint(targetNode)
+                if (canTriggerElement(rule.id, fingerprint)) {
+                    if (performClick(targetNode)) {
+                        recordRuleTrigger(rule.id)
+                        recordElementTrigger(rule.id, fingerprint)
+                        
+                        // Record satisfied key if this rule has a key
+                        if (rule.ruleKey != null && rule.groupKey != null) {
+                            val groupSet = satisfiedKeys.getOrPut(rule.groupKey) { 
+                                java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<Int, Boolean>()) 
+                            }
+                            groupSet.add(rule.ruleKey)
+                            Log.d("AutoClicker", "Sequence Satisfied: Key ${rule.ruleKey} for Group ${rule.groupKey}")
+                        }
+                        
+                        Log.d("AutoClicker", "SUCCESS: Triggered rule [${rule.groupName ?: "Default"}] for $packageName")
+                        serviceScope.launch {
+                            repository.logClick(rule)
+                        }
+                        foundMatch = true
+                        break 
+                    }
+                }
             }
         }
     }
@@ -268,7 +331,7 @@ class AutoClickAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun findAndClick(node: AccessibilityNodeInfo, rule: ClickRule): Boolean {
+    private fun findMatch(node: AccessibilityNodeInfo, rule: ClickRule): AccessibilityNodeInfo? {
         // Phase 12: Rule Exclusion Condition Guard
         if (!rule.excludeCondition.isNullOrEmpty()) {
             try {
@@ -288,7 +351,7 @@ class AutoClickAccessibilityService : AccessibilityService() {
                 // If the exclusion condition matches ANYTHING on the screen, abort this rule
                 if (excludeSelector != null && excludeSelector!!.find(node) != null) {
                     Log.d("AutoClicker", "Rule [${rule.groupName}] suppressed by exclusion condition: ${rule.excludeCondition}")
-                    return false
+                    return null
                 }
             } catch (e: Exception) {
                 Log.e("AutoClicker", "GKD exclusion selector execution failed: ${rule.excludeCondition}", e)
@@ -313,9 +376,7 @@ class AutoClickAccessibilityService : AccessibilityService() {
                 
                 if (selector != null) {
                     val foundNode = selector!!.find(node)
-                    if (foundNode != null && performClick(foundNode)) {
-                        return true
-                    }
+                    if (foundNode != null) return foundNode
                 }
             } catch (e: Exception) {
                 Log.e("AutoClicker", "GKD Selector execution failed: ${rule.selector}", e)
@@ -326,73 +387,74 @@ class AutoClickAccessibilityService : AccessibilityService() {
         // Find by View ID
         if (!rule.targetViewId.isNullOrEmpty()) {
             val nodes = node.findAccessibilityNodeInfosByViewId(rule.targetViewId)
-            if (nodes.isNotEmpty()) {
-                for (foundNode in nodes) {
-                    if (performClick(foundNode)) return true
-                }
-            }
+            if (nodes.isNotEmpty()) return nodes[0]
         }
 
         // Find by Text
-        // ... (system text match is sometimes buggy, so we rely on our DFS anyway)
-        
-        // Depth-first search for partial text match (handles countdowns e.g. 'Skip 5s')
-        if (!rule.targetText.isNullOrEmpty() && dfsSearchText(node, rule.targetText)) {
-            return true
+        if (!rule.targetText.isNullOrEmpty()) {
+             val found = dnsSearchNodeByText(node, rule.targetText)
+             if (found != null) return found
         }
 
         // Ultimate Anti-Obfuscation Fallback: Find by physical screen coordinates
-        // Useful for ImageButtons without text/content description (e.g. Baidu Netdisk)
         if (!rule.boundsInScreen.isNullOrEmpty()) {
             val boundsArray = rule.boundsInScreen.split(",")
             if (boundsArray.size == 4) {
                 try {
                     val targetRect = Rect(boundsArray[0].toInt(), boundsArray[1].toInt(), boundsArray[2].toInt(), boundsArray[3].toInt())
-                    // Only fallback to coordinate click if it's a realistically sized button, not the whole screen
                     if (targetRect.width() > 0 && targetRect.height() > 0) {
-                        if (dfsSearchByBounds(node, targetRect)) return true
+                        val found = dnsSearchNodeByBounds(node, targetRect)
+                        if (found != null) return found
                     }
-                } catch (e: Exception) {
-                    // Ignore parse errors
-                }
+                } catch (e: Exception) { }
             }
         }
 
-        return false
+        return null
     }
     
-    private fun dfsSearchText(node: AccessibilityNodeInfo, targetText: String): Boolean {
-        val nodeText = node.text?.toString() ?: node.contentDescription?.toString()
-        if (nodeText != null && nodeText.contains(targetText, ignoreCase = true)) {
-            if (performClick(node)) return true
+    private fun dnsSearchNodeByText(root: AccessibilityNodeInfo, targetText: String): AccessibilityNodeInfo? {
+        val stack = mutableListOf<AccessibilityNodeInfo>()
+        stack.add(root)
+        
+        while (stack.isNotEmpty()) {
+            val node = stack.removeAt(stack.size - 1)
+            val nodeText = node.text?.toString() ?: node.contentDescription?.toString()
+            if (nodeText != null && nodeText.contains(targetText, ignoreCase = true)) {
+                // Found it, but don't recycle yet as it's the result
+                // Optional: recycle others in stack? Too complex.
+                return node
+            }
+            
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { stack.add(it) }
+            }
         }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (dfsSearchText(child, targetText)) return true
-        }
-        return false
+        return null
     }
 
-    private fun dfsSearchByBounds(node: AccessibilityNodeInfo, targetRect: Rect): Boolean {
-        val nodeRect = Rect()
-        node.getBoundsInScreen(nodeRect)
+    private fun dnsSearchNodeByBounds(root: AccessibilityNodeInfo, targetRect: Rect): AccessibilityNodeInfo? {
+        val stack = mutableListOf<AccessibilityNodeInfo>()
+        stack.add(root)
+        val tolerance = 30
         
-        // Tolerance for dynamic safe areas, status bars, or slight layout shifts (30 pixels)
-        val tolerance = 30 
-        val isMatch = Math.abs(nodeRect.left - targetRect.left) <= tolerance &&
-                      Math.abs(nodeRect.top - targetRect.top) <= tolerance &&
-                      Math.abs(nodeRect.right - targetRect.right) <= tolerance &&
-                      Math.abs(nodeRect.bottom - targetRect.bottom) <= tolerance
+        while (stack.isNotEmpty()) {
+            val node = stack.removeAt(stack.size - 1)
+            val nodeRect = Rect()
+            node.getBoundsInScreen(nodeRect)
+            
+            val isMatch = Math.abs(nodeRect.left - targetRect.left) <= tolerance &&
+                          Math.abs(nodeRect.top - targetRect.top) <= tolerance &&
+                          Math.abs(nodeRect.right - targetRect.right) <= tolerance &&
+                          Math.abs(nodeRect.bottom - targetRect.bottom) <= tolerance
 
-        if (isMatch) {
-            if (performClick(node)) return true
+            if (isMatch) return node
+            
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { stack.add(it) }
+            }
         }
-        
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            if (dfsSearchByBounds(child, targetRect)) return true
-        }
-        return false
+        return null
     }
 
     private fun performClick(node: AccessibilityNodeInfo): Boolean {
@@ -459,7 +521,7 @@ class AutoClickAccessibilityService : AccessibilityService() {
         val sb = StringBuilder()
         sb.append("--- UI HIERARCHY DUMP ---\n")
         sb.append("Package: ${root.packageName}\n")
-        buildDump(root, sb, 0)
+        buildDump(root, sb)
         
         val dumpString = sb.toString()
         Log.d("HierarchyDump", dumpString)
@@ -475,43 +537,120 @@ class AutoClickAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e("HierarchyDump", "Failed to save dump", e)
         }
+
+        // Capture screenshot if API 30+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            takeScreenshot(0, mainExecutor, object : TakeScreenshotCallback {
+                override fun onSuccess(screenshotResult: ScreenshotResult) {
+                    val bitmap = Bitmap.wrapHardwareBuffer(screenshotResult.hardwareBuffer, screenshotResult.colorSpace)
+                                ?.copy(Bitmap.Config.ARGB_8888, false) // Hardware-backed bitmaps can't be compressed directly sometimes
+                    if (bitmap != null) {
+                        try {
+                            val screenFile = java.io.File(getExternalFilesDir(null), "hierarchy_dump.png")
+                            FileOutputStream(screenFile).use { out ->
+                                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                            }
+                            Log.i("AutoClicker", "Screenshot saved: ${screenFile.absolutePath}")
+                            serviceScope.launch(Dispatchers.Main) {
+                                Toast.makeText(this@AutoClickAccessibilityService, "截图快照捕获成功", Toast.LENGTH_SHORT).show()
+                            }
+                        } catch (e: Exception) {
+                            Log.e("AutoClicker", "Failed to save screenshot", e)
+                        }
+                    }
+                }
+                override fun onFailure(errorCode: Int) {
+                    Log.e("AutoClicker", "Screenshot failed: $errorCode")
+                    serviceScope.launch(Dispatchers.Main) {
+                        Toast.makeText(this@AutoClickAccessibilityService, "截图失败: 错误码 $errorCode", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            })
+        }
     }
 
-    private fun buildDump(node: AccessibilityNodeInfo, sb: StringBuilder, depth: Int, visited: MutableSet<AccessibilityNodeInfo> = mutableSetOf()) {
-        // Anti-StackOverflow Safeguards
-        if (depth > 200) return 
-        if (!visited.add(node)) return
-        
-        val indent = "  ".repeat(depth)
-        val vid = node.viewIdResourceName?.substringAfterLast("/") ?: "null"
-        val text = node.text?.toString()?.replace("\n", " ") ?: "null"
-        val desc = node.contentDescription?.toString()?.replace("\n", " ") ?: "null"
-        val bounds = Rect()
-        node.getBoundsInScreen(bounds)
-        
-        sb.append("$indent[${node.className}] vid=$vid, text=\"$text\", desc=\"$desc\", clickable=${node.isClickable}, visible=${node.isVisibleToUser}, bounds=${bounds.toShortString()}\n")
-        
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            buildDump(child, sb, depth + 1, visited)
+    private fun buildDump(root: AccessibilityNodeInfo, sb: StringBuilder) {
+        val stack = mutableListOf<Pair<AccessibilityNodeInfo, Int>>()
+        stack.add(Pair(root, 0))
+        val visited = mutableSetOf<Int>() // Use identity hash codes if possible, or just trust depth
+
+        while (stack.isNotEmpty()) {
+            val (node, depth) = stack.removeAt(stack.size - 1)
+            
+            if (depth > 100) {
+                continue
+            }
+
+            val indent = "  ".repeat(depth)
+            val vid = node.viewIdResourceName?.substringAfterLast("/") ?: "null"
+            val text = node.text?.toString()?.replace("\n", " ") ?: "null"
+            val desc = node.contentDescription?.toString()?.replace("\n", " ") ?: "null"
+            val bounds = Rect()
+            node.getBoundsInScreen(bounds)
+            
+            sb.append("$indent[${node.className}] vid=$vid, text=\"$text\", desc=\"$desc\", clickable=${node.isClickable}, visible=${node.isVisibleToUser}, bounds=${bounds.toShortString()}\n")
+            
+            // Push children in reverse order to maintain correct DFS order in text
+            for (i in node.childCount - 1 downTo 0) {
+                val child = node.getChild(i)
+                if (child != null) {
+                    stack.add(Pair(child, depth + 1))
+                }
+            }
         }
     }
 
     private fun canTriggerRule(ruleId: Int): Boolean {
+        val prefs = getSharedPreferences("autoclick_prefs", Context.MODE_PRIVATE)
+        val cooldownMs = prefs.getInt("global_cooldown", 5000)
+        val maxClicks = prefs.getInt("global_max_clicks", 2)
+        
         var canTrigger = false
         val now = System.currentTimeMillis()
         ruleTriggerHistory.compute(ruleId) { _, history ->
             val currentHistory = history ?: mutableListOf()
             val iterator = currentHistory.iterator()
             while (iterator.hasNext()) {
-                if (now - iterator.next() > 5000) {
+                if (now - iterator.next() > cooldownMs) {
                     iterator.remove()
                 }
             }
-            canTrigger = currentHistory.size < 2
+            canTrigger = currentHistory.size < maxClicks
             currentHistory
         }
         return canTrigger
+    }
+
+    private fun getNodeFingerprint(node: AccessibilityNodeInfo): String {
+        val vid = node.viewIdResourceName ?: "no_vid"
+        val text = node.text?.toString() ?: node.contentDescription?.toString() ?: "no_text"
+        val className = node.className?.toString() ?: "no_class"
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        return "${vid}_${text}_${className}_${bounds.toShortString()}"
+    }
+
+    private fun canTriggerElement(ruleId: Int, fingerprint: String): Boolean {
+        val prefs = getSharedPreferences("autoclick_prefs", Context.MODE_PRIVATE)
+        val elementCooldownMs = prefs.getInt("element_cooldown", 5000)
+        
+        val key = "${ruleId}_$fingerprint"
+        val lastTime = nodeTriggerHistory[key] ?: 0L
+        return (System.currentTimeMillis() - lastTime) > elementCooldownMs
+    }
+
+    private fun recordElementTrigger(ruleId: Int, fingerprint: String) {
+        val key = "${ruleId}_$fingerprint"
+        nodeTriggerHistory[key] = System.currentTimeMillis()
+        
+        // Cleanup old entries occasionally to prevent memory leaks
+        if (nodeTriggerHistory.size > 1000) {
+            val now = System.currentTimeMillis()
+            val it = nodeTriggerHistory.entries.iterator()
+            while (it.hasNext()) {
+                if (now - it.next().value > 10000) it.remove()
+            }
+        }
     }
 
     private fun recordRuleTrigger(ruleId: Int) {

@@ -24,5 +24,10 @@ data class ClickRule(
     val subscriptionName: String? = null,
     
     // Phase 12: Exclusion Condition Support
-    val excludeCondition: String? = null
+    val excludeCondition: String? = null,
+
+    // Phase 20: Multi-stage Click Support
+    val ruleKey: Int? = null,
+    val preKeys: String? = null, // Comma separated list of rule keys
+    val groupKey: Int? = null
 )

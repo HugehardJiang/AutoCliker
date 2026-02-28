@@ -33,6 +33,7 @@ class RuleViewModel(application: Application, private val repository: ClickRuleR
     val isLoadingApps: StateFlow<Boolean> = _isLoadingApps.asStateFlow()
 
     val enabledPackages: StateFlow<Set<String>> = repository.enabledPackages
+    val isGlobalEnabled: StateFlow<Boolean> = repository.isGlobalEnabled
 
 
     val rules: StateFlow<List<ClickRule>> = repository.allRules
@@ -166,6 +167,10 @@ class RuleViewModel(application: Application, private val repository: ClickRuleR
 
     fun togglePackageEnabled(packageName: String, isEnabled: Boolean) {
         repository.togglePackageEnabled(packageName, isEnabled)
+    }
+
+    fun toggleGlobalEnabled(enabled: Boolean) {
+        repository.toggleGlobalEnabled(enabled)
     }
 }
 
